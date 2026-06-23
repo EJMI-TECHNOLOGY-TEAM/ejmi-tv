@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState, useMemo } from "react"
 import Hls from "hls.js"
 import {
   Play,
@@ -30,12 +30,20 @@ function formatTime(seconds) {
 }
 
 export default function LivePlayer() {
+  // REPLACED: improved refs and state for stability, captions and cast
   const videoRef = useRef(null)
   const containerRef = useRef(null)
   const hlsRef = useRef(null)
   const hideTimerRef = useRef(null)
+  const toastTimerRef = useRef(null)
 
-  const [status, setStatus] = useState("loading") // loading | playing | offline
+  // reconnect/backoff refs
+  const reconnectAttemptRef = useRef(0)
+  const reconnectTimerRef = useRef(null)
+  const manifestAbortRef = useRef(null)
+
+  // UI / playback state
+  const [status, setStatus] = useState("loading") // loading | playing | offline | error
   const [isPlaying, setIsPlaying] = useState(false)
   const [isMuted, setIsMuted] = useState(true)
   const [volume, setVolume] = useState(1)
@@ -51,48 +59,88 @@ export default function LivePlayer() {
   const [seekableStart, setSeekableStart] = useState(0)
   const [isLive, setIsLive] = useState(true)
   const [showLiveToast, setShowLiveToast] = useState(false)
-  const toastTimerRef = useRef(null)
 
-  // ---- Setup HLS ----
+  // subtitle tracks discovered (HLS or native)
+  // Each track: { id, name, lang, url, default, hlsIndex }
+  const [subtitleTracks, setSubtitleTracks] = useState([])
+  // Selected subtitle id/lang: "off" | "auto" | trackId/lang
+  const [selectedSubtitle, setSelectedSubtitle] = useState("off")
+
+  // Cast availability/connection state
+  const castSessionRef = useRef(null)
+  const [castAvailable, setCastAvailable] = useState(false)
+  const [castConnected, setCastConnected] = useState(false)
+  const [castLabel, setCastLabel] = useState("Cast")
+
+  // helper: exponential backoff delay
+  const backoffDelay = useCallback((attempt, base = 1000, max = 30000) =>
+    Math.min(max, Math.round(base * Math.pow(2, attempt))), [])
+
+  // ---- Setup HLS (REPLACED useEffect) ----
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
 
     let destroyed = false
 
-    const handlePlaying = () => {
+    const safeSetStatus = (s) => {
       if (destroyed) return
-      setStatus("playing")
-      setIsPlaying(true)
+      setStatus(s)
     }
-    const handlePause = () => setIsPlaying(false)
-    const handlePlay = () => setIsPlaying(true)
-    const handleWaiting = () => { }
-    const handleError = () => {
+
+    const resetReconnect = () => {
+      reconnectAttemptRef.current = 0
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
+    }
+
+    // Sync live state (seekable/currentTime/duration)
+    const syncLiveState = () => {
       if (destroyed) return
-      setStatus("offline")
+      try {
+        setCurrentTime(video.currentTime || 0)
+        if (video.seekable && video.seekable.length > 0) {
+          const end = video.seekable.end(video.seekable.length - 1)
+          const start = video.seekable.start(0)
+          setSeekable(end)
+          setSeekableStart(start)
+          const behind = Math.max(0, end - video.currentTime)
+          // Consider live if within 3s of edge and not paused
+          setIsLive(!video.paused && behind <= 3)
+        }
+        if (Number.isFinite(video.duration)) setDuration(video.duration)
+      } catch {
+        // ignore transient errors reading seekable
+      }
     }
+
+    // Volume handler
     const handleVolume = () => {
       setIsMuted(video.muted || video.volume === 0)
       setVolume(video.volume)
     }
 
-    // Continuously evaluate position relative to the live edge.
-    const syncLiveState = () => {
+    // Playback handlers
+    const handlePlaying = () => {
       if (destroyed) return
-      setCurrentTime(video.currentTime)
-      if (video.seekable && video.seekable.length > 0) {
-        const end = video.seekable.end(video.seekable.length - 1)
-        const start = video.seekable.start(0)
-        setSeekable(end)
-        setSeekableStart(start)
-        // Live when within the 3s threshold of the seekable end (and not paused).
-        const behind = end - video.currentTime
-        setIsLive(!video.paused && behind <= 3)
-      }
-      if (Number.isFinite(video.duration)) setDuration(video.duration)
+      safeSetStatus("playing")
+      setIsPlaying(true)
+      resetReconnect()
+    }
+    const handlePause = () => setIsPlaying(false)
+    const handlePlay = () => setIsPlaying(true)
+    const handleWaiting = () => {
+      // Buffering state: keep playing flag but show loading UI
+      safeSetStatus("loading")
+    }
+    const handleError = () => {
+      if (destroyed) return
+      safeSetStatus("offline")
     }
 
+    // Attach DOM listeners
     video.addEventListener("loadedmetadata", syncLiveState)
     video.addEventListener("playing", handlePlaying)
     video.addEventListener("playing", syncLiveState)
@@ -106,82 +154,281 @@ export default function LivePlayer() {
     video.addEventListener("progress", syncLiveState)
     video.addEventListener("seeking", syncLiveState)
     video.addEventListener("seeked", syncLiveState)
+    video.addEventListener("error", handleError)
 
+    // Detect native WebVTT <track> additions (e.g., Safari or manifest-injected)
+    const trackObserver = new MutationObserver(() => {
+      if (!video) return
+      const tks = []
+      if (video.textTracks && video.textTracks.length > 0) {
+        for (let i = 0; i < video.textTracks.length; i++) {
+          const tt = video.textTracks[i]
+          tks.push({
+            id: tt.id || `native-${i}`,
+            name: tt.label || tt.language || `Track ${i + 1}`,
+            lang: tt.language || "",
+            url: tt.src || "",
+            default: tt.mode === "showing",
+            hlsIndex: undefined,
+            nativeIndex: i,
+          })
+        }
+      }
+      if (tks.length > 0) {
+        setSubtitleTracks((prev) => {
+          const map = new Map(prev.map((p) => [p.id || p.url, p]))
+          tks.forEach((t) => map.set(t.id || t.url, t))
+          return Array.from(map.values())
+        })
+      }
+    })
+    try {
+      trackObserver.observe(video, { childList: true, subtree: true })
+    } catch {
+      // ignore if observe fails
+    }
+
+    // HLS setup
     if (Hls.isSupported()) {
       const hls = new Hls({
+        autoStartLoad: true,
         lowLatencyMode: true,
         liveSyncDurationCount: 3,
-        enableWorker: true,
         backBufferLength: 90,
+        capLevelToPlayerSize: true,
+        enableWorker: true,
+        maxBufferLength: 120,
       })
       hlsRef.current = hls
-      hls.loadSource(STREAM_URL)
-      hls.attachMedia(video)
 
+      // Manifest parsed: levels available
       hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
         if (destroyed) return
         setLevels(data.levels || [])
-        video.muted = true
-        const p = video.play()
-        if (p && p.catch) p.catch(() => { })
+        try {
+          video.muted = true
+          const p = video.play()
+          if (p && p.catch) p.catch(() => {})
+        } catch {}
+        safeSetStatus("playing")
       })
+
+      // Level switched
       hls.on(Hls.Events.LEVEL_SWITCHED, (_e, data) => {
+        if (destroyed) return
         setCurrentLevel(data.level)
       })
+
+      // Subtitle tracks updated (HLS in-manifest subtitles)
+      hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_e, data) => {
+        if (destroyed) return
+        const tracks = (data?.subtitleTracks || []).map((t, i) => ({
+          id: t.id ?? `hls-${i}`,
+          name: t.name || t.lang || t.label || `Subtitle ${i + 1}`,
+          lang: t.lang || "",
+          url: t.url || "",
+          default: !!t.default,
+          hlsIndex: i,
+        }))
+        setSubtitleTracks((prev) => {
+          const map = new Map(prev.map((p) => [p.id || p.url, p]))
+          tracks.forEach((t) => map.set(t.id || t.url, t))
+          return Array.from(map.values())
+        })
+      })
+
+      // Subtitle track switch event: keep selectedSubtitle in sync
+      hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, (_e, data) => {
+        if (destroyed) return
+        const idx = data.id
+        const t = hls.subtitleTracks?.[idx]
+        if (t) {
+          const id = t.id ?? `hls-${idx}`
+          setSelectedSubtitle(id)
+        }
+      })
+
+      // Error handling with recovery and exponential backoff
       hls.on(Hls.Events.ERROR, (_e, data) => {
+        if (destroyed) return
+        if (!data) return
         if (!data.fatal) return
         switch (data.type) {
-          case Hls.ErrorTypes.NETWORK_ERROR:
-            hls.startLoad()
+          case Hls.ErrorTypes.NETWORK_ERROR: {
+            reconnectAttemptRef.current = Math.min(8, reconnectAttemptRef.current + 1)
+            const delay = backoffDelay(reconnectAttemptRef.current)
+            safeSetStatus("loading")
+            if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
+            reconnectTimerRef.current = setTimeout(() => {
+              try {
+                hls.startLoad()
+              } catch {
+                safeSetStatus("offline")
+              }
+            }, delay)
             break
-          case Hls.ErrorTypes.MEDIA_ERROR:
-            hls.recoverMediaError()
+          }
+          case Hls.ErrorTypes.MEDIA_ERROR: {
+            try {
+              hls.recoverMediaError()
+            } catch {
+              safeSetStatus("offline")
+            }
             break
+          }
           default:
-            if (!destroyed) setStatus("offline")
+            safeSetStatus("offline")
             break
         }
       })
+
+      // Attach and load
+      try {
+        hls.loadSource(STREAM_URL)
+        hls.attachMedia(video)
+      } catch {
+        if (video.canPlayType("application/vnd.apple.mpegurl")) {
+          video.src = STREAM_URL
+        } else {
+          safeSetStatus("offline")
+        }
+      }
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
       // Native HLS (Safari / iOS)
-      video.src = STREAM_URL
-      video.muted = true
-      video.addEventListener("loadedmetadata", () => {
+      const attachNativeTracksFromManifest = async (manifestUrl) => {
+        try {
+          if (manifestAbortRef.current) manifestAbortRef.current.abort()
+          const controller = new AbortController()
+          manifestAbortRef.current = controller
+          const res = await fetch(manifestUrl, { signal: controller.signal, cache: "no-store" })
+          if (!res.ok) return
+          const text = await res.text()
+          if (!text) return
+          const lines = text.split(/\r?\n/)
+          const mediaLines = lines.filter((l) => l.startsWith("#EXT-X-MEDIA"))
+          const parsed = []
+          mediaLines.forEach((line, idx) => {
+            const attrs = {}
+            line.replace(/^#EXT-X-MEDIA:/, "").split(",").forEach((kv) => {
+              const [k, v] = kv.split("=")
+              if (!k) return
+              attrs[k.trim()] = v ? v.trim().replace(/^"|"$/g, "") : ""
+            })
+            if (attrs.TYPE === "SUBTITLES" && attrs.URI) {
+              parsed.push({
+                id: `manifest-${idx}`,
+                name: attrs.NAME || attrs.LANGUAGE || attrs.URI,
+                lang: attrs.LANGUAGE || "",
+                url: new URL(attrs.URI, manifestUrl).toString(),
+                default: attrs.DEFAULT === "YES",
+              })
+            }
+          })
+          if (parsed.length > 0) {
+            parsed.forEach((t) => {
+              const exists = Array.from(video.querySelectorAll("track")).some(
+                (tr) => tr.src === t.url || tr.srclang === t.lang
+              )
+              if (!exists) {
+                const track = document.createElement("track")
+                track.kind = "subtitles"
+                track.label = t.name
+                track.srclang = t.lang || ""
+                track.src = t.url
+                track.default = !!t.default
+                track.mode = "hidden"
+                video.appendChild(track)
+              }
+            })
+            setSubtitleTracks((prev) => {
+              const map = new Map(prev.map((p) => [p.id || p.url, p]))
+              parsed.forEach((p) => map.set(p.id || p.url, p))
+              return Array.from(map.values())
+            })
+          }
+        } catch {
+          // ignore manifest fetch errors
+        } finally {
+          manifestAbortRef.current = null
+        }
+      }
+
+      try {
+        video.src = STREAM_URL
+        video.muted = true
+        attachNativeTracksFromManifest(STREAM_URL).catch(() => {})
         const p = video.play()
-        if (p && p.catch) p.catch(() => { })
-      })
-      video.addEventListener("error", handleError)
+        if (p && p.catch) p.catch(() => {})
+        safeSetStatus("playing")
+      } catch {
+        safeSetStatus("offline")
+      }
     } else {
-      setStatus("offline")
+      safeSetStatus("offline")
     }
 
+    // Cleanup on unmount
     return () => {
       destroyed = true
-      video.removeEventListener("loadedmetadata", syncLiveState)
-      video.removeEventListener("playing", handlePlaying)
-      video.removeEventListener("playing", syncLiveState)
-      video.removeEventListener("play", handlePlay)
-      video.removeEventListener("pause", handlePause)
-      video.removeEventListener("pause", syncLiveState)
-      video.removeEventListener("waiting", handleWaiting)
-      video.removeEventListener("waiting", syncLiveState)
-      video.removeEventListener("volumechange", handleVolume)
-      video.removeEventListener("timeupdate", syncLiveState)
-      video.removeEventListener("progress", syncLiveState)
-      video.removeEventListener("seeking", syncLiveState)
-      video.removeEventListener("seeked", syncLiveState)
+      try {
+        video.removeEventListener("loadedmetadata", syncLiveState)
+        video.removeEventListener("playing", handlePlaying)
+        video.removeEventListener("playing", syncLiveState)
+        video.removeEventListener("play", handlePlay)
+        video.removeEventListener("pause", handlePause)
+        video.removeEventListener("pause", syncLiveState)
+        video.removeEventListener("waiting", handleWaiting)
+        video.removeEventListener("waiting", syncLiveState)
+        video.removeEventListener("volumechange", handleVolume)
+        video.removeEventListener("timeupdate", syncLiveState)
+        video.removeEventListener("progress", syncLiveState)
+        video.removeEventListener("seeking", syncLiveState)
+        video.removeEventListener("seeked", syncLiveState)
+        video.removeEventListener("error", handleError)
+      } catch {}
+
       if (hlsRef.current) {
-        hlsRef.current.destroy()
+        try {
+          hlsRef.current.destroy()
+        } catch {}
         hlsRef.current = null
       }
+
+      if (manifestAbortRef.current) {
+        try {
+          manifestAbortRef.current.abort()
+        } catch {}
+        manifestAbortRef.current = null
+      }
+
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
+
+      try {
+        trackObserver.disconnect()
+      } catch {}
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // ---- Fullscreen tracking ----
+  // ---- Fullscreen tracking (REPLACED useEffect) ----
   useEffect(() => {
-    const onFsChange = () => setIsFullscreen(Boolean(document.fullscreenElement))
+    const onFsChange = () => {
+      const fsEl = document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement || document.msFullscreenElement
+      setIsFullscreen(Boolean(fsEl))
+    }
     document.addEventListener("fullscreenchange", onFsChange)
-    return () => document.removeEventListener("fullscreenchange", onFsChange)
+    document.addEventListener("webkitfullscreenchange", onFsChange)
+    document.addEventListener("mozfullscreenchange", onFsChange)
+    document.addEventListener("MSFullscreenChange", onFsChange)
+    return () => {
+      document.removeEventListener("fullscreenchange", onFsChange)
+      document.removeEventListener("webkitfullscreenchange", onFsChange)
+      document.removeEventListener("mozfullscreenchange", onFsChange)
+      document.removeEventListener("MSFullscreenChange", onFsChange)
+    }
   }, [])
 
   // ---- Auto-hide controls ----
@@ -217,8 +464,12 @@ export default function LivePlayer() {
     const video = videoRef.current
     if (!video) return
     if (video.seekable && video.seekable.length > 0) {
-      const liveEdge = video.seekable.end(video.seekable.length - 1)
-      video.currentTime = liveEdge
+      try {
+        const liveEdge = video.seekable.end(video.seekable.length - 1)
+        video.currentTime = liveEdge
+      } catch {
+        // ignore
+      }
     }
     if (video.paused) {
       const p = video.play()
@@ -243,6 +494,9 @@ export default function LivePlayer() {
     if (!video.muted && video.volume === 0) {
       video.volume = 1
     }
+    // update state
+    setIsMuted(video.muted)
+    setVolume(video.volume)
   }, [])
 
   const handleVolumeChange = useCallback((e) => {
@@ -251,6 +505,8 @@ export default function LivePlayer() {
     const v = Number(e.target.value)
     video.volume = v
     video.muted = v === 0
+    setVolume(v)
+    setIsMuted(video.muted)
   }, [])
 
   const toggleFullscreen = useCallback(() => {
@@ -295,44 +551,177 @@ export default function LivePlayer() {
     }
   }, [])
 
+  // ---- Captions (REPLACED toggleCaptions) ----
   const toggleCaptions = useCallback(() => {
     const video = videoRef.current
+    if (!video) return
+
+    // If no subtitle tracks discovered, disable toggle and show tooltip (UI handles tooltip)
+    if (!subtitleTracks || subtitleTracks.length === 0) {
+      setShowCaptions(false)
+      setSelectedSubtitle("off")
+      return
+    }
+
     setShowCaptions((prev) => {
       const next = !prev
-      if (video && video.textTracks) {
-        for (let i = 0; i < video.textTracks.length; i++) {
-          video.textTracks[i].mode = next ? "showing" : "hidden"
+
+      if (hlsRef.current) {
+        try {
+          if (!next) {
+            hlsRef.current.subtitleTrack = -1
+            setSelectedSubtitle("off")
+          } else {
+            const defIdx = subtitleTracks.findIndex((t) => t.default)
+            const idx = defIdx >= 0 ? subtitleTracks[defIdx].hlsIndex : subtitleTracks[0].hlsIndex
+            if (typeof idx === "number") {
+              hlsRef.current.subtitleTrack = idx
+              setSelectedSubtitle(subtitleTracks.find((t) => t.hlsIndex === idx)?.id || "auto")
+            } else {
+              if (video.textTracks && video.textTracks.length > 0) {
+                for (let i = 0; i < video.textTracks.length; i++) {
+                  video.textTracks[i].mode = next ? "showing" : "hidden"
+                }
+                setSelectedSubtitle(next ? "auto" : "off")
+              }
+            }
+          }
+        } catch {
+          if (video.textTracks && video.textTracks.length > 0) {
+            for (let i = 0; i < video.textTracks.length; i++) {
+              video.textTracks[i].mode = next ? "showing" : "hidden"
+            }
+            setSelectedSubtitle(next ? "auto" : "off")
+          }
+        }
+      } else {
+        if (video.textTracks && video.textTracks.length > 0) {
+          for (let i = 0; i < video.textTracks.length; i++) {
+            video.textTracks[i].mode = next ? "showing" : "hidden"
+          }
+          setSelectedSubtitle(next ? "auto" : "off")
+        } else {
+          setSelectedSubtitle("off")
         }
       }
+
       return next
     })
-  }, [])
+  }, [subtitleTracks])
 
-  const handleCast = useCallback(() => {
+  // ---- Cast (REPLACED handleCast) ----
+  const handleCast = useCallback(async () => {
     const video = videoRef.current
-    if (video && typeof video.requestPictureInPicture === "function") {
-      if (document.pictureInPictureElement) {
-        document.exitPictureInPicture?.()
-      } else {
-        video.requestPictureInPicture().catch(() => { })
+    if (!video) return
+
+    // 1) Chromecast (if SDK present)
+    try {
+      if (typeof window !== "undefined" && window.chrome && window.chrome.cast) {
+        const castApi = window.chrome.cast
+        try {
+          const sessionRequest = new castApi.SessionRequest(castApi.media.DEFAULT_MEDIA_RECEIVER_APP_ID)
+          const apiConfig = new castApi.ApiConfig(sessionRequest,
+            (session) => {
+              castSessionRef.current = session
+              setCastConnected(Boolean(session))
+              setCastLabel(session?.receiver?.friendlyName || "Chromecast")
+            },
+            (receiver) => {}
+          )
+          castApi.initialize(apiConfig, () => {
+            castApi.requestSession((session) => {
+              castSessionRef.current = session
+              setCastConnected(true)
+              setCastLabel(session?.receiver?.friendlyName || "Chromecast")
+              try {
+                const mediaInfo = new castApi.media.MediaInfo(STREAM_URL, "application/x-mpegurl")
+                const request = new castApi.media.LoadRequest(mediaInfo)
+                session.loadMedia(request, () => {}, () => {})
+              } catch {}
+            }, () => {})
+          }, () => {})
+          return
+        } catch {
+          // fallthrough
+        }
       }
+    } catch {
+      // ignore
     }
+
+    // 2) Remote Playback API
+    try {
+      if ("remote" in HTMLMediaElement.prototype && video.remote) {
+        await video.remote.prompt()
+        setCastConnected(true)
+        setCastLabel("Remote Device")
+        return
+      }
+    } catch {
+      // fallback
+    }
+
+    // 3) Apple AirPlay (webkitShowPlaybackTargetPicker)
+    try {
+      if (typeof video.webkitShowPlaybackTargetPicker === "function") {
+        try {
+          video.webkitShowPlaybackTargetPicker()
+          setCastConnected(true)
+          setCastLabel("AirPlay")
+          return
+        } catch {
+          // ignore
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    // 4) Picture-in-Picture fallback
+    try {
+      if (document.pictureInPictureEnabled && typeof video.requestPictureInPicture === "function") {
+        if (document.pictureInPictureElement) {
+          await document.exitPictureInPicture()
+          setCastConnected(false)
+        } else {
+          await video.requestPictureInPicture()
+          setCastConnected(true)
+          setCastLabel("Picture in Picture")
+        }
+        return
+      }
+    } catch {
+      // ignore
+    }
+
+    // 5) Not supported
+    setCastAvailable(false)
   }, [])
 
   const selectLevel = useCallback((level) => {
     if (hlsRef.current) {
-      hlsRef.current.currentLevel = level
-      setCurrentLevel(level)
+      try {
+        hlsRef.current.currentLevel = level
+        setCurrentLevel(level)
+      } catch {
+        // ignore
+      }
     }
     setShowSettings(false)
   }, [])
 
-  // ---- Keyboard shortcuts ----
+  // ---- Keyboard shortcuts (REPLACED useEffect) ----
   useEffect(() => {
     const onKey = (e) => {
+      const active = document.activeElement
+      if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable)) return
+
       const video = videoRef.current
       if (!video) return
-      switch (e.key) {
+
+      const key = e.key
+
+      switch (key) {
         case " ":
         case "Spacebar":
           e.preventDefault()
@@ -355,11 +744,15 @@ export default function LivePlayer() {
           break
         case "ArrowLeft":
           e.preventDefault()
-          video.currentTime = Math.max(0, video.currentTime - 10)
+          try {
+            video.currentTime = Math.max(0, video.currentTime - 10)
+          } catch {}
           break
         case "ArrowRight":
           e.preventDefault()
-          video.currentTime = video.currentTime + 10
+          try {
+            video.currentTime = video.currentTime + 10
+          } catch {}
           break
         default:
           break
@@ -409,6 +802,7 @@ export default function LivePlayer() {
         muted
         className="h-full w-full bg-black object-contain"
         onClick={togglePlay}
+        aria-label="Live video player"
       />
 
       {/* Loading screen */}
@@ -493,6 +887,7 @@ export default function LivePlayer() {
           src="/ejmi-logo.png"
           alt="Encounter Jesus Television logo"
           className="pointer-events-none absolute bottom-3 right-3 z-10 w-20 opacity-65 drop-shadow-lg sm:bottom-4 sm:right-6 sm:w-24 md:bottom-6 md:right-8 md:w-28"
+          style={{ opacity: 0.55 }}
         />
       )}
 
@@ -616,8 +1011,31 @@ export default function LivePlayer() {
             {/* Bottom Right */}
             <div className="relative flex items-center gap-2">
               <ControlButton
-                onClick={toggleCaptions}
-                label="Captions"
+                onClick={() => {
+                  if (subtitleTracks.length === 0) return
+                  setShowCaptions((s) => !s)
+                  if (!showCaptions && selectedSubtitle === "off") {
+                    // enable auto if turning on
+                    setSelectedSubtitle("auto")
+                    // if HLS available, pick default via hls event; else show native tracks
+                    if (hlsRef.current && hlsRef.current.subtitleTracks && hlsRef.current.subtitleTracks.length > 0) {
+                      const defIdx = hlsRef.current.subtitleTracks.findIndex((t) => t.default)
+                      const idx = defIdx >= 0 ? defIdx : 0
+                      try {
+                        hlsRef.current.subtitleTrack = idx
+                        setSelectedSubtitle(hlsRef.current.subtitleTracks[idx].id ?? `hls-${idx}`)
+                      } catch {}
+                    } else {
+                      const video = videoRef.current
+                      if (video && video.textTracks && video.textTracks.length > 0) {
+                        for (let i = 0; i < video.textTracks.length; i++) {
+                          video.textTracks[i].mode = "showing"
+                        }
+                      }
+                    }
+                  }
+                }}
+                label={subtitleTracks.length === 0 ? "No captions available" : "Captions"}
                 active={showCaptions}
               >
                 <Subtitles className="h-5 w-5" />
